@@ -1,0 +1,599 @@
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const express = require("express");
+const WebSocket = require("ws");
+
+const app = express();
+const publicDir = path.join(__dirname, "public");
+
+app.use(express.static(publicDir));
+
+app.get("/health", (_, res) => {
+  res.status(200).json({ ok: true });
+});
+
+app.get("/", (_, res) => {
+  res.sendFile(path.join(publicDir, "index.html"));
+});
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+const rooms = new Map();
+
+const prompts = [
+  "Du findest diese Nachricht um 3 Uhr nachts. Schreib einen Post, der sofort viral gehen würde.",
+  "Eine völlig normale Alltagssache wurde zum größten Internet-Skandal des Jahres. Was ist passiert?",
+  "Erfinde einen Post von jemandem, der viel zu selbstbewusst ist.",
+  "Das Internet hat einen neuen Trend. Beschreibe ihn so, dass niemand versteht, warum er existiert.",
+  "Du hast aus Versehen etwas gepostet, das niemals öffentlich werden sollte. Was steht dort?",
+  "Ein Influencer kündigt eine komplett absurde Produktidee an. Was verkauft er?",
+  "Erfinde eine absurde Verschwörungstheorie, die überraschend überzeugend klingt.",
+  "Du antwortest auf einen Post und möchtest maximal verwirren. Was schreibst du?"
+];
+
+function generateRoomCode() {
+  return crypto.randomBytes(2).toString("hex").toUpperCase();
+}
+
+function uniqueRoomCode() {
+  let code;
+
+  do {
+    code = generateRoomCode();
+  } while (rooms.has(code));
+
+  return code;
+}
+
+function send(ws, type, data = {}) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type,
+      ...data
+    }));
+  }
+}
+
+function broadcast(room, type, data = {}) {
+  room.clients.forEach(client => {
+    send(client, type, data);
+  });
+}
+
+function getPlayers(room) {
+  return [...room.clients]
+    .filter(client => client.role === "player")
+    .map(client => ({
+      id: client.id,
+      name: client.name,
+      score: client.score
+    }));
+}
+
+function getPublicState(room) {
+  return {
+    phase: room.phase,
+    round: room.round,
+    maxRounds: room.maxRounds,
+    prompt: room.prompt,
+    players: getPlayers(room),
+    hostConnected: !!room.host
+  };
+}
+
+function resetRound(room) {
+  room.phase = "submit";
+
+  room.prompt =
+    prompts[Math.floor(Math.random() * prompts.length)];
+
+  room.posts = [];
+  room.comments = [];
+
+  room.submitted = new Set();
+  room.commentSubmitted = new Set();
+
+  room.votes = new Map();
+}
+
+function startRound(room) {
+  if (getPlayers(room).length < 3) {
+    if (room.host) {
+      send(room.host, "error", {
+        message: "Mindestens 3 Spieler werden benötigt."
+      });
+    }
+
+    return;
+  }
+
+  room.round = 1;
+
+  resetRound(room);
+
+  broadcast(room, "state", getPublicState(room));
+
+  sendPlayerStates(room);
+}
+
+function sendPlayerStates(room) {
+  room.clients.forEach(client => {
+    if (client.role === "player") {
+      send(client, "state", {
+        ...getPublicState(room),
+        yourId: client.id
+      });
+    }
+
+    if (client.role === "host") {
+      send(client, "state", getPublicState(room));
+    }
+  });
+}
+
+function finishSubmit(room) {
+  if (
+    room.submitted.size <
+    getPlayers(room).length
+  ) {
+    return;
+  }
+
+  room.phase = "comment";
+
+  room.commentSubmitted = new Set();
+
+  sendPlayerStates(room);
+}
+
+function finishComments(room) {
+  if (
+    room.commentSubmitted.size <
+    getPlayers(room).length
+  ) {
+    return;
+  }
+
+  room.phase = "vote";
+
+  room.votes = new Map();
+
+  sendPlayerStates(room);
+
+  room.clients.forEach(client => {
+    send(client, "voteData", {
+      posts: room.posts.map(post => ({
+        ...post,
+
+        comments:
+          room.comments.filter(
+            comment => comment.postId === post.id
+          )
+      })),
+
+      yourId: client.id
+    });
+  });
+}
+
+function finishVotes(room) {
+  if (
+    room.votes.size <
+    getPlayers(room).length
+  ) {
+    return;
+  }
+
+  for (const [voterId, targetAuthorId] of room.votes) {
+    const player =
+      room.clientsById.get(targetAuthorId);
+
+    if (player) {
+      player.score += 100;
+    }
+  }
+
+  room.phase = "results";
+
+  const ranking =
+    getPlayers(room).sort(
+      (a, b) => b.score - a.score
+    );
+
+  broadcast(room, "results", {
+    ranking,
+    round: room.round
+  });
+}
+
+function nextRound(room) {
+  if (room.round >= room.maxRounds) {
+    room.phase = "final";
+
+    broadcast(room, "final", {
+      ranking:
+        getPlayers(room).sort(
+          (a, b) => b.score - a.score
+        )
+    });
+
+    return;
+  }
+
+  room.round++;
+
+  resetRound(room);
+
+  sendPlayerStates(room);
+}
+
+wss.on("connection", ws => {
+  ws.id = crypto.randomUUID();
+
+  ws.role = null;
+  ws.room = null;
+  ws.name = null;
+  ws.score = 0;
+
+  send(ws, "welcome", {
+    id: ws.id
+  });
+
+  ws.on("message", raw => {
+    let message;
+
+    try {
+      message = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
+    /*
+     * ROOM ERSTELLEN
+     */
+
+    if (message.action === "create") {
+      const room = {
+        code: uniqueRoomCode(),
+
+        host: ws,
+
+        clients: new Set([ws]),
+
+        clientsById:
+          new Map([[ws.id, ws]]),
+
+        phase: "lobby",
+
+        round: 0,
+
+        maxRounds: 3,
+
+        prompt: "",
+
+        posts: [],
+
+        comments: [],
+
+        submitted: new Set(),
+
+        commentSubmitted: new Set(),
+
+        votes: new Map()
+      };
+
+      ws.role = "host";
+      ws.room = room;
+
+      rooms.set(room.code, room);
+
+      send(ws, "created", {
+        code: room.code
+      });
+
+      send(ws, "state", getPublicState(room));
+
+      return;
+    }
+
+    /*
+     * RAUM BEITRETEN
+     */
+
+    if (message.action === "join") {
+      const code =
+        String(message.code || "")
+          .trim()
+          .toUpperCase();
+
+      const name =
+        String(message.name || "")
+          .trim()
+          .slice(0, 20);
+
+      const room = rooms.get(code);
+
+      if (!room) {
+        send(ws, "error", {
+          message: "Raum nicht gefunden."
+        });
+
+        return;
+      }
+
+      if (room.phase !== "lobby") {
+        send(ws, "error", {
+          message: "Die Runde läuft bereits."
+        });
+
+        return;
+      }
+
+      if (!name) {
+        send(ws, "error", {
+          message: "Bitte einen Namen eingeben."
+        });
+
+        return;
+      }
+
+      if (getPlayers(room).length >= 8) {
+        send(ws, "error", {
+          message: "Der Raum ist voll."
+        });
+
+        return;
+      }
+
+      const nameExists =
+        getPlayers(room).some(
+          player =>
+            player.name.toLowerCase() ===
+            name.toLowerCase()
+        );
+
+      if (nameExists) {
+        send(ws, "error", {
+          message: "Dieser Name ist bereits vergeben."
+        });
+
+        return;
+      }
+
+      ws.role = "player";
+      ws.name = name;
+      ws.score = 0;
+      ws.room = room;
+
+      room.clients.add(ws);
+      room.clientsById.set(ws.id, ws);
+
+      send(ws, "joined", {
+        code: room.code,
+        yourId: ws.id
+      });
+
+      sendPlayerStates(room);
+
+      return;
+    }
+
+    const room = ws.room;
+
+    if (!room) {
+      return;
+    }
+
+    /*
+     * SPIEL STARTEN
+     */
+
+    if (
+      message.action === "start" &&
+      ws.role === "host"
+    ) {
+      startRound(room);
+
+      return;
+    }
+
+    /*
+     * POST ABSENDEN
+     */
+
+    if (
+      message.action === "submit" &&
+      ws.role === "player" &&
+      room.phase === "submit"
+    ) {
+      if (room.submitted.has(ws.id)) {
+        return;
+      }
+
+      const text =
+        String(message.text || "")
+          .trim()
+          .slice(0, 280);
+
+      if (!text) {
+        return;
+      }
+
+      const post = {
+        id: crypto.randomUUID(),
+
+        authorId: ws.id,
+
+        author: ws.name,
+
+        text
+      };
+
+      room.posts.push(post);
+
+      room.submitted.add(ws.id);
+
+      send(ws, "accepted");
+
+      finishSubmit(room);
+
+      return;
+    }
+
+    /*
+     * KOMMENTAR ABSENDEN
+     */
+
+    if (
+      message.action === "comment" &&
+      ws.role === "player" &&
+      room.phase === "comment"
+    ) {
+      if (room.commentSubmitted.has(ws.id)) {
+        return;
+      }
+
+      const post =
+        room.posts.find(
+          p => p.id === message.postId
+        );
+
+      if (!post || post.authorId === ws.id) {
+        return;
+      }
+
+      const text =
+        String(message.text || "")
+          .trim()
+          .slice(0, 180);
+
+      if (!text) {
+        return;
+      }
+
+      room.comments.push({
+        postId: post.id,
+
+        byId: ws.id,
+
+        by: ws.name,
+
+        text
+      });
+
+      room.commentSubmitted.add(ws.id);
+
+      send(ws, "accepted");
+
+      finishComments(room);
+
+      return;
+    }
+
+    /*
+     * VOTE
+     */
+
+    if (
+      message.action === "vote" &&
+      ws.role === "player" &&
+      room.phase === "vote"
+    ) {
+      if (room.votes.has(ws.id)) {
+        return;
+      }
+
+      const post =
+        room.posts.find(
+          p => p.id === message.postId
+        );
+
+      if (!post || post.authorId === ws.id) {
+        return;
+      }
+
+      room.votes.set(
+        ws.id,
+        post.authorId
+      );
+
+      send(ws, "accepted");
+
+      finishVotes(room);
+
+      return;
+    }
+
+    /*
+     * NÄCHSTE RUNDE
+     */
+
+    if (
+      message.action === "next" &&
+      ws.role === "host" &&
+      room.phase === "results"
+    ) {
+      nextRound(room);
+
+      return;
+    }
+
+    /*
+     * NEUSTART
+     */
+
+    if (
+      message.action === "restart" &&
+      ws.role === "host" &&
+      room.phase === "final"
+    ) {
+      room.clients.forEach(client => {
+        client.score = 0;
+      });
+
+      startRound(room);
+    }
+  });
+
+  ws.on("close", () => {
+    const room = ws.room;
+
+    if (!room) {
+      return;
+    }
+
+    room.clients.delete(ws);
+    room.clientsById.delete(ws.id);
+
+    if (room.host === ws) {
+      room.host = null;
+
+      broadcast(room, "error", {
+        message:
+          "Der Host hat die Verbindung getrennt."
+      });
+    }
+
+    sendPlayerStates(room);
+
+    if (room.clients.size === 0) {
+      rooms.delete(room.code);
+    }
+  });
+});
+
+const PORT =
+  process.env.PORT || 3000;
+
+server.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `Internet Chaos läuft auf Port ${PORT}`
+    );
+  }
+);
